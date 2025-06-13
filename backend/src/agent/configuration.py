@@ -1,42 +1,49 @@
 import os
 from pydantic import BaseModel, Field
-from typing import Any, Optional
+from typing import Any, Optional, List, Dict
+from pathlib import Path
 
 from langchain_core.runnables import RunnableConfig
 
 
 class Configuration(BaseModel):
-    """The configuration for the agent."""
+    """The configuration for the simple chat agent with MCP support."""
 
-    query_generator_model: str = Field(
+    chat_model: str = Field(
         default="gemini-2.0-flash",
         metadata={
-            "description": "The name of the language model to use for the agent's query generation."
+            "description": "The name of the language model to use for the chat agent. Try 'openai:gpt-4' or 'anthropic:claude-3-sonnet' for better reasoning."
         },
     )
 
-    reflection_model: str = Field(
-        default="gemini-2.5-flash-preview-04-17",
+    temperature: float = Field(
+        default=0.7,
         metadata={
-            "description": "The name of the language model to use for the agent's reflection."
+            "description": "The temperature setting for the language model."
         },
     )
 
-    answer_model: str = Field(
-        default="gemini-2.5-pro-preview-05-06",
+    # MCP Server Configuration
+    mcp_servers: Dict[str, Dict[str, Any]] = Field(
+        default_factory=lambda: {
+            "pandapower": {
+                "command": "python",
+                "args": [str(Path(__file__).parent.parent / "mcp" / "panda_mcp.py")],
+                "transport": "stdio",
+                "cwd": None,  # Will be set dynamically
+                "env": None,
+            }
+        },
         metadata={
-            "description": "The name of the language model to use for the agent's answer."
+            "description": "Configuration for MCP servers to connect to."
         },
     )
 
-    number_of_initial_queries: int = Field(
-        default=3,
-        metadata={"description": "The number of initial search queries to generate."},
-    )
-
-    max_research_loops: int = Field(
-        default=2,
-        metadata={"description": "The maximum number of research loops to perform."},
+    enable_mcp: bool = Field(
+        default=True,
+        metadata={
+            "description": "Whether to enable MCP server integration."
+        },
     )
 
     @classmethod

@@ -1,293 +1,255 @@
 import os
-
-from agent.tools_and_schemas import SearchQueryList, Reflection
+import sys
+import asyncio
+from pathlib import Path
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage
-from langgraph.types import Send
-from langgraph.graph import StateGraph
-from langgraph.graph import START, END
+from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.graph import StateGraph, START, END
 from langchain_core.runnables import RunnableConfig
-from google.genai import Client
+from langchain_openai import ChatOpenAI
+from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from agent.state import (
-    OverallState,
-    QueryGenerationState,
-    ReflectionState,
-    WebSearchState,
-)
+from agent.state import ChatState
 from agent.configuration import Configuration
-from agent.prompts import (
-    get_current_date,
-    query_writer_instructions,
-    web_searcher_instructions,
-    reflection_instructions,
-    answer_instructions,
-)
-from langchain_google_genai import ChatGoogleGenerativeAI
-from agent.utils import (
-    get_citations,
-    get_research_topic,
-    insert_citation_markers,
-    resolve_urls,
-)
+from agent.prompts import get_current_date, chat_instructions
 
 load_dotenv()
 
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
+if os.getenv("OPENAI_API_KEY") is None:
+    raise ValueError("OPENAI_API_KEY is not set")
 
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+# Global MCP client instance
+_mcp_client = None
+
+def get_mcp_client(configurable: Configuration) -> MultiServerMCPClient:
+    """Get or create the MCP client instance."""
+    global _mcp_client
+    
+    if _mcp_client is None and configurable.enable_mcp:
+        # Set up MCP server configurations
+        server_configs = {}
+        
+        # Get the current working directory for the MCP server
+        current_dir = Path(__file__).parent.parent  # backend/src
+        
+        for server_name, server_config in configurable.mcp_servers.items():
+            # Set the working directory to the backend/src folder
+            config = server_config.copy()
+            if config["cwd"] is None:
+                config["cwd"] = str(current_dir)
+            
+            server_configs[server_name] = config
+            
+        print(f"🔧 Initializing MCP client with servers: {list(server_configs.keys())}")
+        _mcp_client = MultiServerMCPClient(server_configs)
+        
+    return _mcp_client
 
 
-# Nodes
-def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
-    """LangGraph node that generates a search queries based on the User's question.
+async def get_mcp_tools(configurable: Configuration):
+    """Get MCP tools asynchronously."""
+    if not configurable.enable_mcp:
+        return []
+    
+    try:
+        mcp_client = get_mcp_client(configurable)
+        if mcp_client:
+            tools = await mcp_client.get_tools()
+            print(f"🔧 Available MCP tools: {[tool.name for tool in tools]}")
+            return tools
+    except Exception as e:
+        print(f"⚠️  MCP client initialization failed: {e}")
+        return []
+    
+    return []
 
-    Uses Gemini 2.0 Flash to create an optimized search query for web research based on
-    the User's question.
+
+async def execute_tool_async(tool, tool_call):
+    """Execute a tool call asynchronously."""
+    try:
+        if hasattr(tool, 'ainvoke'):
+            result = await tool.ainvoke(tool_call.get("args", {}))
+        else:
+            # Fallback to sync invocation in thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    executor, tool.invoke, tool_call.get("args", {})
+                )
+        return result
+    except Exception as e:
+        raise e
+
+
+def chat_node(state: ChatState, config: RunnableConfig) -> ChatState:
+    """Enhanced chat node with MCP support for tool calling.
+
+    This node takes the user's message and generates a helpful response using
+    the configured language model, with optional MCP tool integration.
 
     Args:
-        state: Current graph state containing the User's question
-        config: Configuration for the runnable, including LLM provider settings
+        state: Current graph state containing the conversation messages
+        config: Configuration for the runnable, including LLM and MCP settings
 
     Returns:
-        Dictionary with state update, including search_query key containing the generated query
+        Dictionary with state update, including the AI's response message
     """
     configurable = Configuration.from_runnable_config(config)
-
-    # check for custom initial search query count
-    if state.get("initial_search_query_count") is None:
-        state["initial_search_query_count"] = configurable.number_of_initial_queries
-
-    # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
-        temperature=1.0,
+    
+    # Initialize the chat model - Use GPT-4o for better reasoning
+    llm = ChatOpenAI(
+        model="gpt-4o",
+        temperature=configurable.temperature,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        api_key=os.getenv("OPENAI_API_KEY"),
     )
-    structured_llm = llm.with_structured_output(SearchQueryList)
-
-    # Format the prompt
+    
+    # Get MCP tools if enabled (run async operation in sync context)
+    tools = []
+    if configurable.enable_mcp:
+        # Create a new event loop if one doesn't exist
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # Run the async function
+        if loop.is_running():
+            # If loop is already running, we need to use different approach
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, get_mcp_tools(configurable))
+                tools = future.result()
+        else:
+            tools = loop.run_until_complete(get_mcp_tools(configurable))
+    
+    # Bind tools to the model if available
+    if tools:
+        llm = llm.bind_tools(tools)
+        print(f"✅ LLM bound with {len(tools)} MCP tools")
+    
+    # Format the prompt with current date
     current_date = get_current_date()
-    formatted_prompt = query_writer_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        number_queries=state["initial_search_query_count"],
-    )
-    # Generate the search queries
-    result = structured_llm.invoke(formatted_prompt)
-    return {"query_list": result.query}
+    
+    # Enhanced prompt for MCP-enabled agent
+    if tools:
+        enhanced_prompt = f"""{chat_instructions.format(current_date=current_date)}
 
+You have access to specialized tools for power system analysis via pandapower. When users ask about:
+- Power flow analysis
+- Network loading
+- Electrical calculations  
+- Pandapower operations
+- Loading networks from files
 
-def continue_to_web_research(state: QueryGenerationState):
-    """LangGraph node that sends the search queries to the web research node.
+Use the available tools to help them. For pandapower tasks, you can:
+1. Load networks from files (like JSON files) using the load_network tool
+2. Run power flow analysis using the run_power_flow tool
+3. Perform contingency analysis using the run_contingency_analysis tool
+4. Get network information using the get_network_info tool
 
-    This is used to spawn n number of web research nodes, one for each search query.
-    """
-    return [
-        Send("web_research", {"search_query": search_query, "id": int(idx)})
-        for idx, search_query in enumerate(state["query_list"])
-    ]
+CRITICAL: When a user asks you to "solve the power flow" or perform power analysis:
+1. First use load_network tool to load the network file
+2. Then immediately use run_power_flow tool to perform the analysis
+3. Explain the results clearly
 
-
-def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """LangGraph node that performs web research using the native Google Search API tool.
-
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
-
-    Args:
-        state: Current graph state containing the search query and research loop count
-        config: Configuration for the runnable, including search API settings
-
-    Returns:
-        Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
-    """
-    # Configure
-    configurable = Configuration.from_runnable_config(config)
-    formatted_prompt = web_searcher_instructions.format(
-        current_date=get_current_date(),
-        research_topic=state["search_query"],
-    )
-
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
-    response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
-    )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
-    )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
-
-    return {
-        "sources_gathered": sources_gathered,
-        "search_query": [state["search_query"]],
-        "web_research_result": [modified_text],
-    }
-
-
-def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
-    """LangGraph node that identifies knowledge gaps and generates potential follow-up queries.
-
-    Analyzes the current summary to identify areas for further research and generates
-    potential follow-up queries. Uses structured output to extract
-    the follow-up query in JSON format.
-
-    Args:
-        state: Current graph state containing the running summary and research topic
-        config: Configuration for the runnable, including LLM provider settings
-
-    Returns:
-        Dictionary with state update, including search_query key containing the generated follow-up query
-    """
-    configurable = Configuration.from_runnable_config(config)
-    # Increment the research loop count and get the reasoning model
-    state["research_loop_count"] = state.get("research_loop_count", 0) + 1
-    reasoning_model = state.get("reasoning_model") or configurable.reasoning_model
-
-    # Format the prompt
-    current_date = get_current_date()
-    formatted_prompt = reflection_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n\n---\n\n".join(state["web_research_result"]),
-    )
-    # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
-
-    return {
-        "is_sufficient": result.is_sufficient,
-        "knowledge_gap": result.knowledge_gap,
-        "follow_up_queries": result.follow_up_queries,
-        "research_loop_count": state["research_loop_count"],
-        "number_of_ran_queries": len(state["search_query"]),
-    }
-
-
-def evaluate_research(
-    state: ReflectionState,
-    config: RunnableConfig,
-) -> OverallState:
-    """LangGraph routing function that determines the next step in the research flow.
-
-    Controls the research loop by deciding whether to continue gathering information
-    or to finalize the summary based on the configured maximum number of research loops.
-
-    Args:
-        state: Current graph state containing the research loop count
-        config: Configuration for the runnable, including max_research_loops setting
-
-    Returns:
-        String literal indicating the next node to visit ("web_research" or "finalize_summary")
-    """
-    configurable = Configuration.from_runnable_config(config)
-    max_research_loops = (
-        state.get("max_research_loops")
-        if state.get("max_research_loops") is not None
-        else configurable.max_research_loops
-    )
-    if state["is_sufficient"] or state["research_loop_count"] >= max_research_loops:
-        return "finalize_answer"
+Don't just say you will do something - actually complete the full task by calling the necessary tools in sequence."""
     else:
-        return [
-            Send(
-                "web_research",
-                {
-                    "search_query": follow_up_query,
-                    "id": state["number_of_ran_queries"] + int(idx),
-                },
-            )
-            for idx, follow_up_query in enumerate(state["follow_up_queries"])
-        ]
+        enhanced_prompt = chat_instructions.format(current_date=current_date)
+    
+    # Get the conversation messages and add the system prompt
+    messages = [{"role": "system", "content": enhanced_prompt}] + state["messages"]
+    
+    # Generate response
+    response = llm.invoke(messages)
+    
+    # Handle tool calls if present
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        print(f"🔧 Executing {len(response.tool_calls)} tool call(s)...")
+        
+        # Execute tool calls asynchronously
+        async def execute_all_tools():
+            tool_results = []
+            for tool_call in response.tool_calls:
+                try:
+                    # Find the matching tool
+                    matching_tool = None
+                    for tool in tools:
+                        if tool.name == tool_call["name"]:
+                            matching_tool = tool
+                            break
+                    
+                    if matching_tool:
+                        result = await execute_tool_async(matching_tool, tool_call)
+                        tool_results.append({
+                            "tool_call_id": tool_call.get("id", f"call_{tool_call['name']}"),
+                            "name": tool_call["name"],
+                            "content": str(result)
+                        })
+                        print(f"✅ Tool '{tool_call['name']}' executed successfully")
+                    else:
+                        error_msg = f"Tool '{tool_call['name']}' not found"
+                        tool_results.append({
+                            "tool_call_id": tool_call.get("id", f"call_{tool_call['name']}"),
+                            "name": tool_call["name"],
+                            "content": error_msg
+                        })
+                        print(f"❌ {error_msg}")
+                        
+                except Exception as e:
+                    error_msg = f"Tool '{tool_call['name']}' failed: {str(e)}"
+                    tool_results.append({
+                        "tool_call_id": tool_call.get("id", f"call_{tool_call['name']}"),
+                        "name": tool_call["name"],
+                        "content": error_msg
+                    })
+                    print(f"❌ {error_msg}")
+            
+            return tool_results
+        
+        # Execute tools
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, execute_all_tools())
+                tool_results = future.result()
+        else:
+            tool_results = loop.run_until_complete(execute_all_tools())
+        
+        # Create tool messages for the conversation
+        tool_messages = []
+        for result in tool_results:
+            tool_messages.append(ToolMessage(
+                content=result["content"],
+                tool_call_id=result["tool_call_id"]
+            ))
+        
+        # Create a follow-up conversation with tool results
+        follow_up_messages = messages + [response] + tool_messages
+        
+        # Get final response with tool results incorporated
+        final_response = llm.invoke(follow_up_messages)
+        return {"messages": [AIMessage(content=final_response.content)]}
+    
+    return {"messages": [AIMessage(content=response.content)]}
 
 
-def finalize_answer(state: OverallState, config: RunnableConfig):
-    """LangGraph node that finalizes the research summary.
+# Create the MCP-enhanced chat graph
+builder = StateGraph(ChatState, config_schema=Configuration)
 
-    Prepares the final output by deduplicating and formatting sources, then
-    combining them with the running summary to create a well-structured
-    research report with proper citations.
+# Add the enhanced chat node
+builder.add_node("chat", chat_node)
 
-    Args:
-        state: Current graph state containing the running summary and sources gathered
+# Set up the simple flow: START -> chat -> END
+builder.add_edge(START, "chat")
+builder.add_edge("chat", END)
 
-    Returns:
-        Dictionary with state update, including running_summary key containing the formatted final summary with sources
-    """
-    configurable = Configuration.from_runnable_config(config)
-    reasoning_model = state.get("reasoning_model") or configurable.reasoning_model
-
-    # Format the prompt
-    current_date = get_current_date()
-    formatted_prompt = answer_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n---\n\n".join(state["web_research_result"]),
-    )
-
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    result = llm.invoke(formatted_prompt)
-
-    # Replace the short urls with the original urls and add all used urls to the sources_gathered
-    unique_sources = []
-    for source in state["sources_gathered"]:
-        if source["short_url"] in result.content:
-            result.content = result.content.replace(
-                source["short_url"], source["value"]
-            )
-            unique_sources.append(source)
-
-    return {
-        "messages": [AIMessage(content=result.content)],
-        "sources_gathered": unique_sources,
-    }
-
-
-# Create our Agent Graph
-builder = StateGraph(OverallState, config_schema=Configuration)
-
-# Define the nodes we will cycle between
-builder.add_node("generate_query", generate_query)
-builder.add_node("web_research", web_research)
-builder.add_node("reflection", reflection)
-builder.add_node("finalize_answer", finalize_answer)
-
-# Set the entrypoint as `generate_query`
-# This means that this node is the first one called
-builder.add_edge(START, "generate_query")
-# Add conditional edge to continue with search queries in a parallel branch
-builder.add_conditional_edges(
-    "generate_query", continue_to_web_research, ["web_research"]
-)
-# Reflect on the web research
-builder.add_edge("web_research", "reflection")
-# Evaluate the research
-builder.add_conditional_edges(
-    "reflection", evaluate_research, ["web_research", "finalize_answer"]
-)
-# Finalize the answer
-builder.add_edge("finalize_answer", END)
-
-graph = builder.compile(name="pro-search-agent")
+# Compile the graph
+graph = builder.compile(name="mcp-chat-agent")
